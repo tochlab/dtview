@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::app::App;
+use crate::app::{App, SearchMode};
 use crate::dtb::value;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -16,43 +16,121 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let list_area = chunks[0];
     let view_rows = list_area.height as usize;
 
-    let rows = app.visible_rows();
-    let sel = rows.iter().position(|r| *r == app.selected).unwrap_or(0);
-
-    let start = if sel < app.offset {
-        sel
-    } else if sel >= app.offset + view_rows {
-        sel.saturating_sub(view_rows.saturating_sub(1))
+    if let Some(mode) = app.search_mode {
+        let (title, items, selected, offset) = match mode {
+            SearchMode::Input => (
+                format!("Search property: {}", app.search_query),
+                app.search_results
+                    .iter()
+                    .map(|result| {
+                        format!(
+                            "{}  ({})",
+                            result.property_name,
+                            app.node_path(&result.path)
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                None,
+                0,
+            ),
+            SearchMode::Results => (
+                format!("Search results: {}", app.search_query),
+                app.search_results
+                    .iter()
+                    .map(|result| {
+                        format!(
+                            "{}  ({})",
+                            result.property_name,
+                            app.node_path(&result.path)
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                Some(app.search_selected),
+                app.search_offset,
+            ),
+        };
+        let visible = view_rows.saturating_sub(2);
+        let start = if let Some(selected) = selected {
+            if selected < offset {
+                selected
+            } else if selected >= offset + visible {
+                selected.saturating_sub(visible.saturating_sub(1))
+            } else {
+                offset
+            }
+        } else {
+            0
+        };
+        let items = items
+            .iter()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+            .map(|(index, item)| {
+                let style = if selected == Some(start + index) {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(item.clone()).style(style)
+            })
+            .collect::<Vec<_>>();
+        if mode == SearchMode::Results {
+            app.search_offset = start;
+        }
+        f.render_widget(
+            List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+                "{title}  (Enter: {})",
+                if mode == SearchMode::Input {
+                    "select"
+                } else {
+                    "go to"
+                }
+            ))),
+            list_area,
+        );
     } else {
-        app.offset
-    };
+        let rows = app.visible_rows();
+        let sel = rows.iter().position(|r| *r == app.selected).unwrap_or(0);
 
-    let mut items: Vec<ListItem> = Vec::new();
-    for path in rows.iter().skip(start).take(view_rows) {
-        let node = app.node_at(path);
-        let indent = "  ".repeat(path.len().saturating_sub(1));
-        let prefix = if node.children.is_empty() {
-            "  "
-        } else if app.is_expanded(path) {
-            "▾ "
+        let start = if sel < app.offset {
+            sel
+        } else if sel >= app.offset + view_rows {
+            sel.saturating_sub(view_rows.saturating_sub(1))
         } else {
-            "▸ "
+            app.offset
         };
-        let name = format!("{indent}{prefix}{}", node.name);
-        let style = if *path == app.selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        items.push(ListItem::new(name).style(style));
+
+        let mut items: Vec<ListItem> = Vec::new();
+        for path in rows.iter().skip(start).take(view_rows) {
+            let node = app.node_at(path);
+            let indent = "  ".repeat(path.len().saturating_sub(1));
+            let prefix = if node.children.is_empty() {
+                "  "
+            } else if app.is_expanded(path) {
+                "▾ "
+            } else {
+                "▸ "
+            };
+            let name = format!("{indent}{prefix}{}", node.name);
+            let style = if *path == app.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            items.push(ListItem::new(name).style(style));
+        }
+        app.offset = start;
+
+        let list = List::new(items).block(Block::default().borders(Borders::ALL).title("DTB"));
+        f.render_widget(list, list_area);
     }
-    app.offset = start;
-
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("DTB"));
-    f.render_widget(list, list_area);
 
     let node = app.selected_node();
     let parent = app.selected_parent_node();
@@ -106,10 +184,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .resolve_property(prop)
             .map(|paths| format!(" → {}", paths.join(", ")))
             .unwrap_or_default();
-        lines.push(Line::from(format!(
-            "{} = {}{}   [{}]",
-            prop.name, v.text, reference, v.kind
-        )));
+        let line = format!("{} = {}{}   [{}]", prop.name, v.text, reference, v.kind);
+        let style = if app
+            .highlighted_property
+            .as_ref()
+            .is_some_and(|(path, index)| path == &app.selected && *index == lines.len() - 1)
+        {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(line, style)));
     }
     if node.children.is_empty() {
         lines.push(Line::from("(leaf node)"));

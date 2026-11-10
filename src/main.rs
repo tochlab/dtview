@@ -58,11 +58,9 @@ fn run_tui(app: &mut App) -> io::Result<()> {
         terminal.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
+            && app.handle_key(key)
         {
-            if key.code == event::KeyCode::Char('q') || key.code == event::KeyCode::Esc {
-                break;
-            }
-            app.handle_key(key);
+            break;
         }
     }
 
