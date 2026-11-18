@@ -27,8 +27,9 @@ pub enum SearchMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
     pub path: Vec<usize>,
-    pub property_index: usize,
+    pub property_index: Option<usize>,
     pub property_name: String,
+    pub node_match: bool,
 }
 
 impl App {
@@ -99,25 +100,19 @@ impl App {
 
     pub fn visible_rows(&self) -> Vec<Vec<usize>> {
         let mut out = Vec::new();
-        self.collect_rows(vec![], &self.dtb.root, &mut out, true);
-        out
-    }
-
-    fn collect_rows(
-        &self,
-        path: Vec<usize>,
-        node: &Node,
-        out: &mut Vec<Vec<usize>>,
-        is_root: bool,
-    ) {
-        out.push(path.clone());
-        if is_root || self.is_expanded(&path) {
-            for (i, child) in node.children.iter().enumerate() {
-                let mut p = path.clone();
-                p.push(i);
-                self.collect_rows(p, child, out, false);
+        let mut stack = vec![vec![]];
+        while let Some(path) = stack.pop() {
+            out.push(path.clone());
+            let node = self.node_at(&path);
+            if path.is_empty() || self.is_expanded(&path) {
+                for index in (0..node.children.len()).rev() {
+                    let mut child_path = path.clone();
+                    child_path.push(index);
+                    stack.push(child_path);
+                }
             }
         }
+        out
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -219,34 +214,35 @@ impl App {
             return;
         }
         let query = self.search_query.to_lowercase();
-        Self::collect_search_results(
-            &self.dtb.root,
-            &mut Vec::new(),
-            &query,
-            &mut self.search_results,
-        );
-    }
-
-    fn collect_search_results(
-        node: &Node,
-        path: &mut Vec<usize>,
-        query: &str,
-        results: &mut Vec<SearchResult>,
-    ) {
-        for (property_index, property) in node.properties.iter().enumerate() {
-            if property.name.to_lowercase().contains(query) {
+        let mut stack = vec![vec![]];
+        let mut results = Vec::new();
+        while let Some(path) = stack.pop() {
+            let node = self.node_at(&path);
+            if node.name.to_lowercase().contains(&query) {
                 results.push(SearchResult {
                     path: path.clone(),
-                    property_index,
-                    property_name: property.name.clone(),
+                    property_index: None,
+                    property_name: node.name.clone(),
+                    node_match: true,
                 });
             }
+            for (property_index, property) in node.properties.iter().enumerate() {
+                if property.name.to_lowercase().contains(&query) {
+                    results.push(SearchResult {
+                        path: path.clone(),
+                        property_index: Some(property_index),
+                        property_name: property.name.clone(),
+                        node_match: false,
+                    });
+                }
+            }
+            for index in (0..node.children.len()).rev() {
+                let mut child_path = path.clone();
+                child_path.push(index);
+                stack.push(child_path);
+            }
         }
-        for (index, child) in node.children.iter().enumerate() {
-            path.push(index);
-            Self::collect_search_results(child, path, query, results);
-            path.pop();
-        }
+        self.search_results = results;
     }
 
     fn jump_to_search_result(&mut self) {
@@ -260,7 +256,9 @@ impl App {
             }
         }
         self.selected = result.path.clone();
-        self.highlighted_property = Some((result.path, result.property_index));
+        self.highlighted_property = result
+            .property_index
+            .map(|property_index| (result.path, property_index));
         self.search_mode = None;
     }
 
@@ -271,7 +269,7 @@ impl App {
     fn collapse_selected(&mut self) {
         if self.is_expanded(&self.selected) {
             self.toggle_selected();
-        } else if self.selected.len() > 1 {
+        } else if !self.selected.is_empty() {
             self.selected.pop();
         }
     }
@@ -338,12 +336,20 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
 
-        assert_eq!(app.search_results.len(), 2);
-        assert_eq!(app.search_results[0].property_name, "compatible");
-        assert_eq!(app.search_results[1].property_name, "clock-frequency");
+        let property_matches: Vec<_> = app
+            .search_results
+            .iter()
+            .filter(|result| !result.node_match)
+            .map(|result| result.property_name.as_str())
+            .collect();
+        assert_eq!(property_matches, ["compatible", "clock-frequency"]);
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.search_selected = app
+            .search_results
+            .iter()
+            .position(|result| result.property_name == "clock-frequency")
+            .unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.selected, vec![0, 0]);
@@ -351,5 +357,36 @@ mod tests {
         assert!(app.is_expanded(&[0]));
         assert_eq!(app.highlighted_property, Some((vec![0, 0], 0)));
         assert_eq!(app.search_mode, None);
+    }
+
+    #[test]
+    fn left_collapses_to_root_from_a_direct_child() {
+        let mut app = App::new(test_dtb());
+        app.selected = vec![0];
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn search_finds_node_names_and_jumps_to_the_node() {
+        let mut app = App::new(test_dtb());
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for ch in "uart".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        let result_index = app
+            .search_results
+            .iter()
+            .position(|result| result.node_match && result.property_name == "uart@0")
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.search_selected = result_index;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.selected, vec![0, 0]);
+        assert!(app.is_expanded(&[]));
+        assert!(app.is_expanded(&[0]));
+        assert_eq!(app.highlighted_property, None);
     }
 }

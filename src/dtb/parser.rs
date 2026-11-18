@@ -25,7 +25,6 @@ pub enum ParseError {
     PropertiesAfterChildren,
     InvalidEnd,
     InvalidRoot,
-    MissingEnd,
     UnterminatedReservations,
 }
 
@@ -62,7 +61,6 @@ impl fmt::Display for ParseError {
             ParseError::InvalidRoot => {
                 write!(f, "root node has a non-empty name")
             }
-            ParseError::MissingEnd => write!(f, "structure block is missing FDT_END"),
             ParseError::UnterminatedReservations => {
                 write!(f, "unterminated memory reservation block")
             }
@@ -201,18 +199,19 @@ pub fn parse(buf: &[u8]) -> Result<Dtb, ParseError> {
 
     let struct_start = off_dt_struct as usize;
     let strings_start = off_dt_strings as usize;
+    let reservations_start = off_mem_rsvmap as usize;
     if struct_start < header_size
-        || strings_start < struct_start
+        || strings_start < header_size
         || strings_start > buf.len()
-        || (off_mem_rsvmap as usize) < header_size
-        || off_mem_rsvmap as usize >= struct_start
+        || reservations_start < header_size
+        || reservations_start >= struct_start
     {
         return Err(ParseError::InvalidSectionLayout);
     }
     let struct_size = if let Some(size) = size_dt_struct {
         size as usize
     } else {
-        infer_struct_size(&buf[struct_start..strings_start])?
+        infer_struct_size(&buf[struct_start..])?
     };
     let struct_end = struct_start
         .checked_add(struct_size)
@@ -220,12 +219,34 @@ pub fn parse(buf: &[u8]) -> Result<Dtb, ParseError> {
     let strings_end = strings_start
         .checked_add(size_dt_strings as usize)
         .ok_or(ParseError::InvalidSectionLayout)?;
-    if struct_end > strings_start || strings_end > buf.len() {
+    let reservations_limit = [struct_start, strings_start]
+        .into_iter()
+        .filter(|&start| start > reservations_start)
+        .min()
+        .unwrap_or(buf.len());
+    let (reservations, reservations_size) =
+        parse_reservations(&buf[reservations_start..reservations_limit])?;
+    let reservations_end = reservations_start + reservations_size;
+    if struct_end > buf.len()
+        || strings_end > buf.len()
+        || overlaps(struct_start, struct_end, strings_start, strings_end)
+        || overlaps(
+            reservations_start,
+            reservations_end,
+            struct_start,
+            struct_end,
+        )
+        || overlaps(
+            reservations_start,
+            reservations_end,
+            strings_start,
+            strings_end,
+        )
+    {
         return Err(ParseError::InvalidSectionLayout);
     }
     let struct_buf = &buf[struct_start..struct_end];
     let strings_buf = &buf[strings_start..strings_end];
-    let reservations = parse_reservations(&buf[off_mem_rsvmap as usize..struct_start])?;
 
     let name_at = |off: usize| -> Result<String, ParseError> {
         if off >= strings_buf.len() {
@@ -257,7 +278,11 @@ pub fn parse(buf: &[u8]) -> Result<Dtb, ParseError> {
     })
 }
 
-fn parse_reservations(buf: &[u8]) -> Result<Vec<Reservation>, ParseError> {
+fn overlaps(start_a: usize, end_a: usize, start_b: usize, end_b: usize) -> bool {
+    start_a < end_b && start_b < end_a
+}
+
+fn parse_reservations(buf: &[u8]) -> Result<(Vec<Reservation>, usize), ParseError> {
     let mut r = Reader::new(buf);
     let mut entries = Vec::new();
     loop {
@@ -267,7 +292,7 @@ fn parse_reservations(buf: &[u8]) -> Result<Vec<Reservation>, ParseError> {
         let address = r.read_u64()?;
         let size = r.read_u64()?;
         if address == 0 && size == 0 {
-            return Ok(entries);
+            return Ok((entries, r.pos));
         }
         entries.push(Reservation { address, size });
     }
@@ -311,48 +336,48 @@ fn parse_structure(
     name_at: &dyn Fn(usize) -> Result<String, ParseError>,
 ) -> Result<Node, ParseError> {
     let mut r = Reader::new(buf);
-    r.skip_nops()?;
-    let token = r.read_u32()?;
-    if token != FDT_BEGIN_NODE {
-        return Err(ParseError::BadToken(token));
-    }
-    let mut root = parse_node_body(&mut r, name_at)?;
-    if !root.name.is_empty() {
-        return Err(ParseError::InvalidRoot);
-    }
-    root.name = "/".into();
-    if r.remaining() < 4 {
-        return Err(ParseError::MissingEnd);
-    }
-    if r.read_u32()? != FDT_END {
-        return Err(ParseError::MissingEnd);
-    }
-    if r.remaining() != 0 {
-        return Err(ParseError::InvalidEnd);
-    }
-    Ok(root)
-}
-
-fn parse_node_body(
-    r: &mut Reader,
-    name_at: &dyn Fn(usize) -> Result<String, ParseError>,
-) -> Result<Node, ParseError> {
-    let name = r.read_node_name()?;
-
-    let mut node = Node {
-        name,
-        properties: Vec::new(),
-        children: Vec::new(),
-    };
-
-    let mut has_children = false;
+    let mut stack: Vec<(Node, bool)> = Vec::new();
+    let mut root = None;
     loop {
         r.skip_nops()?;
         let token = r.read_u32()?;
         match token {
-            FDT_END_NODE => return Ok(node),
+            FDT_BEGIN_NODE => {
+                let name = r.read_node_name()?;
+                if stack.is_empty() && root.is_none() {
+                    if !name.is_empty() {
+                        return Err(ParseError::InvalidRoot);
+                    }
+                } else if let Some((_, has_children)) = stack.last_mut() {
+                    *has_children = true;
+                } else {
+                    return Err(ParseError::InvalidRoot);
+                }
+                stack.push((
+                    Node {
+                        name,
+                        properties: Vec::new(),
+                        children: Vec::new(),
+                    },
+                    false,
+                ));
+            }
+            FDT_END_NODE => {
+                let Some((mut node, _)) = stack.pop() else {
+                    return Err(ParseError::UnbalancedNodes);
+                };
+                if stack.is_empty() {
+                    node.name = "/".into();
+                    root = Some(node);
+                } else if let Some((parent, _)) = stack.last_mut() {
+                    parent.children.push(node);
+                }
+            }
             FDT_PROP => {
-                if has_children {
+                let Some((node, has_children)) = stack.last_mut() else {
+                    return Err(ParseError::UnbalancedNodes);
+                };
+                if *has_children {
                     return Err(ParseError::PropertiesAfterChildren);
                 }
                 let len = r.read_u32()? as usize;
@@ -364,13 +389,17 @@ fn parse_node_body(
                 let name = name_at(nameoff)?;
                 node.properties.push(Property { name, value });
             }
-            FDT_BEGIN_NODE => {
-                has_children = true;
-                let child = parse_node_body(r, name_at)?;
-                node.children.push(child);
-            }
             FDT_NOP => continue,
-            FDT_END => return Err(ParseError::UnbalancedNodes),
+            FDT_END => {
+                if !stack.is_empty() {
+                    return Err(ParseError::UnbalancedNodes);
+                }
+                let root = root.ok_or(ParseError::InvalidRoot)?;
+                if r.remaining() != 0 {
+                    return Err(ParseError::InvalidEnd);
+                }
+                return Ok(root);
+            }
             other => return Err(ParseError::BadToken(other)),
         }
     }
@@ -491,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_reservation_entries_and_ignores_trailing_bytes() {
+    fn parses_reservation_entries_and_ignores_bytes_after_total_size() {
         let mut dtb = build_dtb();
         dtb[40..48].copy_from_slice(&0x0000000180000000u64.to_be_bytes());
         dtb[48..56].copy_from_slice(&0x0000000000002000u64.to_be_bytes());
@@ -501,6 +530,30 @@ mod tests {
         assert_eq!(parsed.reservations.len(), 1);
         assert_eq!(parsed.reservations[0].address, 0x180000000);
         assert_eq!(parsed.reservations[0].size, 0x2000);
+    }
+
+    #[test]
+    fn parses_strings_block_before_structure_block() {
+        let mut dtb = build_dtb();
+        let struct_start = u32::from_be_bytes(dtb[8..12].try_into().unwrap()) as usize;
+        let strings_start = u32::from_be_bytes(dtb[12..16].try_into().unwrap()) as usize;
+        let strings_size = u32::from_be_bytes(dtb[32..36].try_into().unwrap()) as usize;
+        let struct_size = u32::from_be_bytes(dtb[36..40].try_into().unwrap()) as usize;
+        let strings = dtb[strings_start..strings_start + strings_size].to_vec();
+        let structure = dtb[struct_start..struct_start + struct_size].to_vec();
+        dtb.truncate(struct_start);
+        dtb.extend_from_slice(&strings);
+        dtb.resize(align4(dtb.len()), 0);
+        let reordered_struct_start = dtb.len();
+        dtb.extend_from_slice(&structure);
+        dtb[8..12].copy_from_slice(&(reordered_struct_start as u32).to_be_bytes());
+        dtb[12..16].copy_from_slice(&(struct_start as u32).to_be_bytes());
+        let total_size = dtb.len() as u32;
+        dtb[4..8].copy_from_slice(&total_size.to_be_bytes());
+
+        let parsed = parse(&dtb).unwrap();
+        assert_eq!(parsed.root.children[0].name, "uart@1000");
+        assert_eq!(parsed.root.children[0].properties[0].name, "reg");
     }
 
     #[test]
@@ -524,6 +577,16 @@ mod tests {
     fn rejects_unterminated_reservation_list() {
         let mut dtb = build_dtb();
         dtb[40..72].fill(1);
+        assert_eq!(parse(&dtb), Err(ParseError::UnterminatedReservations));
+    }
+
+    #[test]
+    fn rejects_reservation_map_without_terminator_before_structure() {
+        let mut dtb = build_dtb();
+        dtb[40..48].copy_from_slice(&0x0000000180000000u64.to_be_bytes());
+        dtb[48..56].copy_from_slice(&0x0000000000002000u64.to_be_bytes());
+        dtb[56..72].fill(1);
+
         assert_eq!(parse(&dtb), Err(ParseError::UnterminatedReservations));
     }
 

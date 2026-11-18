@@ -24,7 +24,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     .iter()
                     .map(|result| {
                         format!(
-                            "{}  ({})",
+                            "{}: {}  ({})",
+                            if result.node_match {
+                                "node"
+                            } else {
+                                "property"
+                            },
                             result.property_name,
                             app.node_path(&result.path)
                         )
@@ -39,7 +44,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     .iter()
                     .map(|result| {
                         format!(
-                            "{}  ({})",
+                            "{}: {}  ({})",
+                            if result.node_match {
+                                "node"
+                            } else {
+                                "property"
+                            },
                             result.property_name,
                             app.node_path(&result.path)
                         )

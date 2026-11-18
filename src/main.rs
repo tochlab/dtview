@@ -44,15 +44,11 @@ fn main() -> io::Result<()> {
 
 fn run_tui(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
+    let _terminal_guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    let restore = || {
-        disable_raw_mode().ok();
-        execute!(io::stdout(), LeaveAlternateScreen).ok();
-    };
 
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
@@ -64,6 +60,14 @@ fn run_tui(app: &mut App) -> io::Result<()> {
         }
     }
 
-    restore();
     Ok(())
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        execute!(io::stdout(), LeaveAlternateScreen).ok();
+    }
 }

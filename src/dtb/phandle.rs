@@ -57,61 +57,65 @@ impl PhandleMap {
 }
 
 fn collect_providers(node: &Node, path: String, providers: &mut HashMap<u32, Provider>) {
-    let mut cell_counts = HashMap::new();
-    for (property, cell_name) in [
-        ("#clock-cells", "#clock-cells"),
-        ("#reset-cells", "#reset-cells"),
-        ("#dma-cells", "#dma-cells"),
-        ("#phy-cells", "#phy-cells"),
-        ("#power-domain-cells", "#power-domain-cells"),
-        ("#iommu-cells", "#iommu-cells"),
-        ("#interrupt-cells", "#interrupt-cells"),
-        ("#gpio-cells", "#gpio-cells"),
-        ("#pwm-cells", "#pwm-cells"),
-        ("#mbox-cells", "#mbox-cells"),
-        ("#io-channel-cells", "#io-channel-cells"),
-        ("#interconnect-cells", "#interconnect-cells"),
-        ("#sound-dai-cells", "#sound-dai-cells"),
-        ("#cooling-cells", "#cooling-cells"),
-        ("#nvmem-cell-cells", "#nvmem-cell-cells"),
-        ("#msi-cells", "#msi-cells"),
-    ] {
-        if let Some(count) = node
-            .properties
-            .iter()
-            .find(|item| item.name == property)
-            .and_then(|item| cells(&item.value))
-            .and_then(|value| value.first().copied())
-        {
-            cell_counts.insert(cell_name, count as usize);
+    let mut stack = vec![(node, path)];
+    while let Some((node, path)) = stack.pop() {
+        let mut cell_counts = HashMap::new();
+        for (property, cell_name) in [
+            ("#clock-cells", "#clock-cells"),
+            ("#reset-cells", "#reset-cells"),
+            ("#dma-cells", "#dma-cells"),
+            ("#phy-cells", "#phy-cells"),
+            ("#power-domain-cells", "#power-domain-cells"),
+            ("#iommu-cells", "#iommu-cells"),
+            ("#interrupt-cells", "#interrupt-cells"),
+            ("#gpio-cells", "#gpio-cells"),
+            ("#pwm-cells", "#pwm-cells"),
+            ("#mbox-cells", "#mbox-cells"),
+            ("#io-channel-cells", "#io-channel-cells"),
+            ("#interconnect-cells", "#interconnect-cells"),
+            ("#sound-dai-cells", "#sound-dai-cells"),
+            ("#cooling-cells", "#cooling-cells"),
+            ("#nvmem-cell-cells", "#nvmem-cell-cells"),
+            ("#msi-cells", "#msi-cells"),
+        ] {
+            if let Some(count) = node
+                .properties
+                .iter()
+                .find(|item| item.name == property)
+                .and_then(|item| cells(&item.value))
+                .and_then(|value| value.first().copied())
+            {
+                cell_counts.insert(cell_name, count as usize);
+            }
         }
-    }
 
-    for property in &node.properties {
-        if matches!(property.name.as_str(), "phandle" | "linux,phandle")
-            && let Some(handle) = cells(&property.value).and_then(|value| value.first().copied())
-        {
-            providers.insert(
-                handle,
-                Provider {
-                    path: if path.is_empty() {
-                        "/".into()
-                    } else {
-                        path.clone()
+        for property in &node.properties {
+            if matches!(property.name.as_str(), "phandle" | "linux,phandle")
+                && let Some(handle) =
+                    cells(&property.value).and_then(|value| value.first().copied())
+            {
+                providers.insert(
+                    handle,
+                    Provider {
+                        path: if path.is_empty() {
+                            "/".into()
+                        } else {
+                            path.clone()
+                        },
+                        cells: cell_counts.clone(),
                     },
-                    cells: cell_counts.clone(),
-                },
-            );
+                );
+            }
         }
-    }
 
-    for child in &node.children {
-        let child_path = if path.is_empty() {
-            format!("/{}", child.name)
-        } else {
-            format!("{path}/{}", child.name)
-        };
-        collect_providers(child, child_path, providers);
+        for child in node.children.iter().rev() {
+            let child_path = if path.is_empty() {
+                format!("/{}", child.name)
+            } else {
+                format!("{path}/{}", child.name)
+            };
+            stack.push((child, child_path));
+        }
     }
 }
 
